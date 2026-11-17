@@ -25,34 +25,47 @@ import (
 
 var portfolioPath = regexp.MustCompile(`^/(?:[a-z]{2}(?:-[A-Z]{2})?/)?copy-trading/lead-details/([0-9]+)$`)
 
-//go:embed dashboard.html
+//go:embed dashboard.html trader.html
 var pages embed.FS
-var dashboard = template.Must(template.New("dashboard.html").Funcs(template.FuncMap{
+var pageTemplates = template.Must(template.New("").Funcs(template.FuncMap{
 	"money": func(v float64) string { return fmt.Sprintf("%.2f", v) },
 	"date":  func(v int64) string { return time.UnixMilli(v).UTC().Format("2006-01-02 15:04 UTC") },
-}).ParseFS(pages, "dashboard.html"))
+}).ParseFS(pages, "dashboard.html", "trader.html"))
 
 type trader struct {
-	ID, Name, Start, LastError                string
-	Slippage, TradingFee, ProfitShare         float64
-	StartingBalance                           float64
-	Updated                                   int64
-	Balance, Profit, SmallPnL                 float64
-	Count, OldCount, SmallCount, Wins, Losses int
+	ID, Name, Start, LastError        string
+	Slippage, TradingFee, ProfitShare float64
+	StartingBalance                   float64
+	Updated                           int64
+	Balance, Profit, SmallPnL         float64
+	Count, SmallCount, Wins, Losses   int
 }
 
 type trade struct {
 	ID, Symbol, Side, Status string
 	Opened, Closed           int64
 	Margin, PnL, SourcePnL   float64
-	Old, Small               bool
+	Small                    bool
+}
+
+type symbolCount struct {
+	Symbol string
+	Count  int
+}
+
+type equityPoint struct {
+	Closed  int64
+	Balance float64
 }
 
 type view struct {
-	Traders  []trader
-	Selected *trader
-	Trades   []trade
-	Notice   string
+	Traders   []trader
+	Selected  *trader
+	Trades    []trade
+	Symbols   []symbolCount
+	Equity    []equityPoint
+	Notice    string
+	SmallOnly bool
 }
 
 type app struct {
@@ -99,6 +112,7 @@ CREATE TABLE IF NOT EXISTS trades (trader_id TEXT NOT NULL, id TEXT NOT NULL, sy
 	mux.HandleFunc("GET /traders/{id}", a.index)
 	mux.HandleFunc("POST /traders", a.add)
 	mux.HandleFunc("POST /traders/{id}/settings", a.settings)
+	mux.HandleFunc("POST /traders/{id}/delete", a.deleteTrader)
 	log.Printf("Dashboard: http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }
@@ -221,6 +235,39 @@ func (a *app) settings(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/traders/"+r.PathValue("id"), http.StatusSeeOther)
 }
 
+func (a *app) deleteTrader(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	tx, err := a.db.Begin()
+	if err != nil {
+		http.Error(w, "database error", 500)
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM trades WHERE trader_id=?`, id); err != nil {
+		http.Error(w, "database error", 500)
+		return
+	}
+	result, err := tx.Exec(`DELETE FROM traders WHERE id=?`, id)
+	if err != nil {
+		http.Error(w, "database error", 500)
+		return
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		http.Error(w, "database error", 500)
+		return
+	}
+	if n == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "database error", 500)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (a *app) syncNow(t trader) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -232,10 +279,10 @@ func (a *app) syncNow(t trader) {
 
 func (a *app) index(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.db.Query(`SELECT t.id,t.name,t.start,t.slippage,t.trading_fee,t.profit_share,t.starting_balance,t.updated,t.error,
-		COALESCE(SUM(CASE WHEN x.old=0 THEN x.pnl ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN x.old=0 AND x.small=1 THEN x.pnl ELSE 0 END),0),
-		COUNT(CASE WHEN x.old=0 THEN 1 END), COUNT(CASE WHEN x.old=1 THEN 1 END), COUNT(CASE WHEN x.old=0 AND x.small=1 THEN 1 END),
-		COUNT(CASE WHEN x.old=0 AND x.pnl>0 THEN 1 END), COUNT(CASE WHEN x.old=0 AND x.pnl<0 THEN 1 END)
+		COALESCE(SUM(CASE WHEN x.closed>=unixepoch(t.start)*1000 THEN x.pnl ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN x.closed>=unixepoch(t.start)*1000 AND x.small=1 THEN x.pnl ELSE 0 END),0),
+		COUNT(CASE WHEN x.closed>=unixepoch(t.start)*1000 THEN 1 END), COUNT(CASE WHEN x.closed>=unixepoch(t.start)*1000 AND x.small=1 THEN 1 END),
+		COUNT(CASE WHEN x.closed>=unixepoch(t.start)*1000 AND x.pnl>0 THEN 1 END), COUNT(CASE WHEN x.closed>=unixepoch(t.start)*1000 AND x.pnl<0 THEN 1 END)
 		FROM traders t LEFT JOIN trades x ON x.trader_id=t.id GROUP BY t.id ORDER BY t.id`)
 	if err != nil {
 		http.Error(w, "database error", 500)
@@ -244,7 +291,7 @@ func (a *app) index(w http.ResponseWriter, r *http.Request) {
 	v := view{Notice: "Public Binance history exposes closed futures positions only. Open positions and unrealized P&L are unavailable; balances are closed-trade estimates, not live wallet equity."}
 	for rows.Next() {
 		var t trader
-		if err = rows.Scan(&t.ID, &t.Name, &t.Start, &t.Slippage, &t.TradingFee, &t.ProfitShare, &t.StartingBalance, &t.Updated, &t.LastError, &t.Profit, &t.SmallPnL, &t.Count, &t.OldCount, &t.SmallCount, &t.Wins, &t.Losses); err != nil {
+		if err = rows.Scan(&t.ID, &t.Name, &t.Start, &t.Slippage, &t.TradingFee, &t.ProfitShare, &t.StartingBalance, &t.Updated, &t.LastError, &t.Profit, &t.SmallPnL, &t.Count, &t.SmallCount, &t.Wins, &t.Losses); err != nil {
 			break
 		}
 		t.Balance = t.StartingBalance + t.Profit
@@ -270,21 +317,45 @@ func (a *app) index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if v.Selected != nil {
-		filter := ""
-		if r.URL.Query().Get("small") == "1" {
-			filter = " AND small=1"
+		start, _ := time.Parse("2006-01-02", v.Selected.Start)
+		rows, err = a.db.Query(`SELECT symbol,COUNT(*) FROM trades WHERE trader_id=? AND closed>=? GROUP BY symbol ORDER BY COUNT(*) DESC, symbol`, id, start.UnixMilli())
+		if err != nil {
+			http.Error(w, "database error", 500)
+			return
 		}
-		rows, err = a.db.Query(`SELECT id,symbol,side,opened,closed,margin,source_pnl,pnl,old,small,status FROM trades WHERE trader_id=?`+filter+` ORDER BY closed DESC LIMIT 500`, id)
+		for rows.Next() {
+			var s symbolCount
+			if err = rows.Scan(&s.Symbol, &s.Count); err != nil {
+				break
+			}
+			v.Symbols = append(v.Symbols, s)
+		}
+		if e := rows.Err(); err == nil {
+			err = e
+		}
+		rows.Close()
+		if err != nil {
+			http.Error(w, "database error", 500)
+			return
+		}
+		v.SmallOnly = r.URL.Query().Get("small") == "1"
+		balance := v.Selected.StartingBalance
+		v.Equity = append(v.Equity, equityPoint{Closed: start.UnixMilli(), Balance: balance})
+		rows, err = a.db.Query(`SELECT id,symbol,side,opened,closed,margin,source_pnl,pnl,small,status FROM trades WHERE trader_id=? AND closed>=? ORDER BY closed,id`, id, start.UnixMilli())
 		if err != nil {
 			http.Error(w, "database error", 500)
 			return
 		}
 		for rows.Next() {
 			var x trade
-			if err = rows.Scan(&x.ID, &x.Symbol, &x.Side, &x.Opened, &x.Closed, &x.Margin, &x.SourcePnL, &x.PnL, &x.Old, &x.Small, &x.Status); err != nil {
+			if err = rows.Scan(&x.ID, &x.Symbol, &x.Side, &x.Opened, &x.Closed, &x.Margin, &x.SourcePnL, &x.PnL, &x.Small, &x.Status); err != nil {
 				break
 			}
-			v.Trades = append(v.Trades, x)
+			balance += x.PnL
+			v.Equity = append(v.Equity, equityPoint{Closed: x.Closed, Balance: balance})
+			if !v.SmallOnly || x.Small {
+				v.Trades = append(v.Trades, x)
+			}
 		}
 		if e := rows.Err(); err == nil {
 			err = e
@@ -296,7 +367,11 @@ func (a *app) index(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := dashboard.Execute(w, v); err != nil {
+	page := "dashboard.html"
+	if v.Selected != nil {
+		page = "trader.html"
+	}
+	if err := pageTemplates.ExecuteTemplate(w, page, v); err != nil {
 		log.Print(err)
 	}
 }
@@ -422,12 +497,18 @@ func (a *app) sync(ctx context.Context, t trader) error {
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
-	start, _ := time.Parse("2006-01-02", t.Start)
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM traders WHERE id=?`, t.ID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return nil
+	}
 	for _, p := range all {
 		if p.ID == "" || p.Opened <= 0 || p.Closed <= 0 || p.Volume <= 0 || p.AvgCost <= 0 || p.AvgClose <= 0 || (!strings.EqualFold(p.Side, "Long") && !strings.EqualFold(p.Side, "Short")) {
 			continue
@@ -447,12 +528,12 @@ func (a *app) sync(ctx context.Context, t trader) error {
 		if allocated <= 0 || math.IsNaN(allocated) || math.IsInf(allocated, 0) {
 			continue
 		}
-		old := p.Opened < start.UnixMilli() || p.Closed < start.UnixMilli()
 		small := allocated < 10
 		pnl := simulatedPnL(p, allocated, leverage, t)
+		// Keep the legacy old column for existing databases; inclusion now depends on close time.
 		_, err = tx.Exec(`INSERT INTO trades(trader_id,id,symbol,side,opened,closed,margin,source_pnl,pnl,old,small,status)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trader_id,id) DO UPDATE SET symbol=excluded.symbol,side=excluded.side,opened=excluded.opened,closed=excluded.closed,margin=excluded.margin,source_pnl=excluded.source_pnl,pnl=excluded.pnl,old=excluded.old,small=excluded.small,status=excluded.status`,
-			t.ID, p.ID, p.Symbol, p.Side, p.Opened, p.Closed, allocated, p.PnL, pnl, old, small, p.Status)
+			t.ID, p.ID, p.Symbol, p.Side, p.Opened, p.Closed, allocated, p.PnL, pnl, 0, small, p.Status)
 		if err != nil {
 			return err
 		}
