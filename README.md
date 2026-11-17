@@ -1,0 +1,17 @@
+# Binance portfolio tracker
+
+Go dashboard for tracking **public Binance lead portfolios**, backed by SQLite. Paste a lead-details URL, choose a UTC start date, and visit the dashboard. The server polls Binance every 10 minutes; the browser refreshes every 10 seconds. It does **not** place trades.
+
+```sh
+go run . -addr 127.0.0.1:8080 -db tracker.db
+```
+
+Open http://127.0.0.1:8080. Keep `tracker.db` for your history. Go 1.23+ is required; `go` downloads the SQLite driver on the first run. The default binding is local-only and has no authentication; do not expose it to the internet without access controls.
+
+For live-reload development run `air` in the project directory (configuration in `.air.toml`). It binds to `0.0.0.0:8080` so you can open `http://SERVER_IP:8080` from your network. **Anyone who can reach that port can edit the dashboard**; use only on a trusted network or behind access control.
+
+## What the figures mean
+
+- Each trader begins at **200 USDT by default**, editable on their page (also when adding them). The new-trader date defaults to **2026-11-01**. For a closed position, estimated original margin is `closedVolume × avgCost ÷ leverage`. Simulated margin is `starting balance × original margin ÷ current reported portfolio margin balance`, capped at the starting balance. Simulated gross P&L is calculated from Binance's average entry/exit prices and scaled position size, then adjusted for **slippage (default 0.05% per side), copier trading fees (default 0.05% per side), and profit sharing (default 10% of profitable simulated trades only)**. These are editable assumptions, not rates fetched from your Binance account; the profit-sharing percentage may differ by trader. Binance's reported net `closingPnl` is saved for reference but **not used** in the simulated P&L to avoid double-counting the lead trader's fees. Funding and other adjustments present in Binance's reported net P&L are not modeled. A simulated position under 10 USDT is still counted, flagged, and separately totaled.
+- Trades opened **before** the chosen date are stored as **old**, visible but excluded from statistics. Closed positions opened on or after the date are backfilled if Binance still publishes them. Repeated polls upsert positions by ID, so they do not double-count.
+- **Critical limitations:** The public lead-portfolio endpoints expose closed **futures** positions, not open positions or spot trades. Thus open-position P&L, actual wallet equity, and a true historical paper-trading replay cannot be computed. A position already open at your chosen historical date is marked old rather than pretending its unknown start-date entry price is known. The portfolio's **current**, not historical, balance is used to estimate allocation, so backfilled or later figures may change with the trader's balance. Position-history pagination and retention also limit how far back the data goes. This is an approximation, not investment advice.

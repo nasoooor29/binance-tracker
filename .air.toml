@@ -1,0 +1,9 @@
+root = "."
+tmp_dir = "/tmp/opencode/binance-tracker-air"
+
+[build]
+cmd = "/tmp/opencode/go/bin/go build -o /tmp/opencode/binance-tracker-air/app ."
+bin = "/tmp/opencode/binance-tracker-air/app"
+include_ext = ["go", "html", "toml"]
+exclude_dir = [".git"]
+args_bin = ["-addr", "0.0.0.0:8080", "-db", "tracker.db"]
